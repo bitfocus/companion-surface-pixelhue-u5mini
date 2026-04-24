@@ -16,5 +16,5 @@ Pixelhue U5 Mini 的 Companion 4.3 **Surface 模块**（独立包 + 子进程 + 
 
 ## 说明
 
-- **已实现**：`init` / `destroy`、`getPluginFeatures`（`supportsOutbound`）、发现、`setupRemoteConnections` 内建 TCP、`notifyOpenedDiscoveredSurface`、`draw` / `blankSurface` / `closeDevice`、按键通过 `surfaceEvents` 上报。
-- **可选依赖**：`@pixelhue/event-controller-sdk`（动态导入）；未安装时模块可加载，发现与远程连接能力受限。
+- **已实现**：`init` / `destroy`、通过 `SurfacePluginRemote`（`PixelhueRemote`）提供出站配置字段与 `startConnections` / `stopConnections`、发现、`setupRemoteConnections` 内建 TCP、`notifyOpenedDiscoveredSurface`、`draw` / `blankSurface` / `closeDevice`、按键通过 `surfaceEvents` 上报。
+- **依赖**：`@pixelhue/event-controller-sdk`（TCP 与发现）。

@@ -1,15 +1,15 @@
-import type { OpenSurfaceResult, SurfaceContext, SurfacePlugin } from '@companion-surface/base'
+import type {
+	CardGenerator,
+	OpenSurfaceResult,
+	SurfaceContext,
+	SurfaceDrawProps,
+	SurfacePlugin,
+} from '@companion-surface/base'
 import { PixelhueSurfaceModule } from './surface-module.js'
 import { DEFAULT_SURFACE_LAYOUT } from './layout.js'
 import type { HostContext, OpenDeviceResult } from './types.js'
 import { PixelhueRemote, type PixelhueRemoteDeviceInfo } from './remote.js'
 import { PIXELHUE_U5_MINI_NAME } from './constants.js'
-
-interface DrawProps {
-	controlId?: string
-	image?: Uint8Array
-	page?: unknown
-}
 
 const surfaceContexts = new Map<string, SurfaceContext>()
 let moduleInstance: PixelhueSurfaceModule | null = null
@@ -112,15 +112,16 @@ const plugin: SurfacePlugin<PixelhueRemoteDeviceInfo> = {
 				await moduleInstance?.blankSurface(surfaceId)
 			},
 			/** draw：将宿主的 draw props 转成 moduleInstance.draw 的参数格式。 */
-			async draw(signal: { aborted?: boolean } | undefined, props: DrawProps): Promise<void> {
-				if (signal?.aborted) return
+			async draw(signal: AbortSignal, props: SurfaceDrawProps): Promise<void> {
+				if (signal.aborted) return
 				if (!props?.controlId) return
 				const imageBuf = props.image ? Buffer.from(props.image) : undefined
-				moduleInstance?.draw(surfaceId, [
+				const page = (props as unknown as Record<string, unknown>).page ?? 1
+				await moduleInstance?.draw(surfaceId, [
 					{
 						controlId: String(props.controlId),
 						image: imageBuf,
-						page: props.page ?? null,
+						page,
 					},
 				])
 			},
@@ -132,16 +133,16 @@ const plugin: SurfacePlugin<PixelhueRemoteDeviceInfo> = {
 			async showLockedStatus(locked: boolean, characterCount: number): Promise<void> {
 				await moduleInstance?.showLockedStatus(surfaceId, locked, characterCount)
 			},
-			/** brightness：本模块不直接使用 */
+			/** 亮度：设备协议未实现，与 registerProps.brightness=false 一致 */
 			async setBrightness(_brightness: number): Promise<void> {},
-			/** showStatus：本模块不实现额外状态 */
-			async showStatus(): Promise<void> {},
+			/** 状态图：本 surface 不使用 Satellite 式状态卡 */
+			async showStatus(_signal: AbortSignal, _cardGenerator: CardGenerator, _statusMessage: string): Promise<void> {},
 		}
 
 		return {
 			surface,
 			registerProps: {
-				brightness: true,
+				brightness: false,
 				surfaceLayout: DEFAULT_SURFACE_LAYOUT as any,
 				pincodeMap: null,
 				location: null,

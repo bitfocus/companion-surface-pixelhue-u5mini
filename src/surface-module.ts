@@ -1,7 +1,10 @@
-import { MiniConnectionManager, MiniDiscoveryService } from '@pixelhue/event-controller-sdk'
+import { MiniDiscoveryService, MiniConnectionManager } from '@pixelhue/event-controller-sdk'
 import type { DiscoveredRemoteSurfaceInfo, RemoteSurfaceConnectionInfo } from '@companion-surface/base'
 import { createModuleLogger } from '@companion-surface/base'
+import { PNG } from 'pngjs'
 import {
+	BUTTON_HEIGHT,
+	BUTTON_WIDTH,
 	DEFAULT_TCP_PORT,
 	MAX_DRAW_QUEUE_LENGTH,
 	IPV4_REGEX,
@@ -10,9 +13,7 @@ import {
 	CONNECT_WAIT_TIMEOUT_MS,
 } from './constants.js'
 import { DEFAULT_SURFACE_LAYOUT } from './layout.js'
-import { remoteCheckConfigMatchesExpression, remoteConfigFields } from './constants.js'
 import type { DeviceInfoT, DrawItem, HostContext, OpenConnection, OpenDeviceResult } from './types.js'
-import { companionRawPixelsToPngBytes, pngBytesToPixelhueBase64 } from './utils/draw-encoding.js'
 
 class PixelhueSurfaceModule {
 	readonly #logger = createModuleLogger('PixelhueSurfaceModule')
@@ -65,37 +66,15 @@ class PixelhueSurfaceModule {
 		for (const conn of this.#openConnections.values()) {
 			try {
 				conn.close()
-			} catch (_e) {}
+			} catch {
+				// ignore close errors during teardown
+			}
 		}
 		this.#openConnections.clear()
 		this.#activeConnections.clear()
 		this.#connectionRefCounts.clear()
 		this.#sharedConnections.clear()
 		this.#openedSurfaceIds.clear()
-	}
-
-	/**
-	 * 向宿主报告本模块能力：
-	 */
-	getPluginFeatures(): {
-		supportsDetection: boolean
-		supportsHid: boolean
-		supportsScan: boolean
-		supportsOutbound: {
-			configFields: any[]
-			configMatchesExpression: string | null
-			maxOutboundConnections?: number
-		} | null
-	} {
-		return {
-			supportsDetection: false,
-			supportsHid: false,
-			supportsScan: false,
-			supportsOutbound: {
-				configFields: remoteConfigFields,
-				configMatchesExpression: remoteCheckConfigMatchesExpression,
-			},
-		}
 	}
 
 	/**
@@ -113,7 +92,8 @@ class PixelhueSurfaceModule {
 				continue
 			}
 
-			const port = Number(config?.port) ?? DEFAULT_TCP_PORT
+			const portNum = Number(config?.port)
+			const port = Number.isFinite(portNum) && portNum >= 1 && portNum <= 65535 ? Math.floor(portNum) : DEFAULT_TCP_PORT
 			const addressKey = `${address}:${port}`
 
 			// 无实际变化的更新
@@ -196,28 +176,17 @@ class PixelhueSurfaceModule {
 		for (const prop of drawProps) {
 			const controlId = prop.controlId ?? ''
 			const [col, row] = controlId.split('_').map(Number)
-			if (isNaN(col) || isNaN(row)) {
-				this.#logger.warn(`draw skipped: invalid controlId surfaceId=${surfaceId} controlId=${controlId}`)
-				continue
-			}
-
-			let base64: string
-			if (!Buffer.isBuffer(prop.image)) {
+			if (isNaN(col) || isNaN(row) || !Buffer.isBuffer(prop.image)) {
 				this.#logger.warn(
 					`draw skipped: unsupported image type surfaceId=${surfaceId} controlId=${controlId} imageType=${typeof prop.image}`,
 				)
 				continue
 			}
 
-			const pngBytes = companionRawPixelsToPngBytes(prop.image)
-			if (!pngBytes) {
-				this.#logger.warn(
-					`draw skipped: unknown raw pixel buffer surfaceId=${surfaceId} controlId=${controlId} byteLength=${prop.image.length} page=${prop.page}`,
-				)
-				continue
-			}
-
-			base64 = pngBytesToPixelhueBase64(pngBytes)
+			const png = new PNG({ width: BUTTON_WIDTH, height: BUTTON_HEIGHT })
+			prop.image.copy(png.data)
+			const pngBytes = PNG.sync.write(png)
+			const base64 = `base64,${pngBytes.toString('base64')}`
 
 			const item: DrawItem = {
 				controlId,
@@ -284,7 +253,9 @@ class PixelhueSurfaceModule {
 				connectionManager?.disconnectFrom?.(address, port, {
 					autoReconnect: true,
 				})
-			} catch (_e) {}
+			} catch {
+				// ignore disconnect errors during close
+			}
 			// 删除所有指向该 endpoint 的别名连接
 			for (const [id, key] of this.#activeConnections.entries()) {
 				if (key === addressKey) {
@@ -351,7 +322,11 @@ class PixelhueSurfaceModule {
 	 * - 按键 press/release => inputPress
 	 */
 	#handleDeviceData(surfaceId: string, data: Record<string, unknown>): void {
+		try {
+			this.#logger.debug(`receive data surfaceId=${surfaceId} payload=${JSON.stringify(data)}`)
+		} catch {}
 		if (!data || typeof data !== 'object') return
+
 		const events = this.#context.surfaceEvents
 		if (!events) return
 		if (data.type === 0 || data.type === 1) {
@@ -423,7 +398,7 @@ class PixelhueSurfaceModule {
 
 			const [col, row] = item.controlId.split('_').map(Number)
 			try {
-				this.#logger.debug(
+				this.#logger.info(
 					`draw send surfaceId=${surfaceId} controlId=${item.controlId} column=${col} row=${row} base64Length=${item.base64.length} page=${item.page}`,
 				)
 				c.socketWrapper?.send?.({
@@ -432,7 +407,9 @@ class PixelhueSurfaceModule {
 					row,
 					data: item.base64,
 				})
-			} catch (_e) {}
+			} catch {
+				// ignore send errors; queue continues
+			}
 
 			setImmediate(() => sendOne())
 		}
@@ -483,7 +460,7 @@ class PixelhueSurfaceModule {
 			surfaceLayout: DEFAULT_SURFACE_LAYOUT,
 			location: `${address}:${port}`,
 			isRemote: true,
-			supportsBrightness: true,
+			supportsBrightness: false,
 		}
 		this.#context.notifyOpenedDiscoveredSurface?.(info).catch((error: unknown) => {
 			this.#logger.error(`Failed to notify opened discovered surface: ${JSON.stringify(error)}`)

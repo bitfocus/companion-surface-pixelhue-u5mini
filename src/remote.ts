@@ -44,6 +44,6 @@ export class PixelhueRemote
 	 */
 	async stopConnections(connectionIds: string[]): Promise<void> {
 		const moduleInstance = this.getModuleInstance()
-		moduleInstance?.stopRemoteConnections?.(connectionIds)
+		await moduleInstance?.stopRemoteConnections?.(connectionIds)
 	}
 }

@@ -17,7 +17,6 @@ export const CONNECTED_POLL_DELAY_MS = 300
 /** draw 队列等待 socket 就绪的最长时间，超时后丢弃积压帧 */
 export const CONNECT_WAIT_TIMEOUT_MS = 15000
 
-export const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 export const BUTTON_WIDTH = 72
 export const BUTTON_HEIGHT = 72
 export const PIXELHUE_U5_MINI_NAME = 'Pixelhue U5 Mini'

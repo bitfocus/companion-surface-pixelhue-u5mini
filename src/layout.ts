@@ -25,4 +25,3 @@ export function buildSurfaceLayout(): OpenDeviceResult['surfaceLayout'] {
 }
 
 export const DEFAULT_SURFACE_LAYOUT = buildSurfaceLayout()
-
