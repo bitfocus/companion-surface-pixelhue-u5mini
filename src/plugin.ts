@@ -116,7 +116,7 @@ const plugin: SurfacePlugin<PixelhueRemoteDeviceInfo> = {
 				if (signal.aborted) return
 				if (!props?.controlId) return
 				const imageBuf = props.image ? Buffer.from(props.image) : undefined
-				const page = (props as unknown as Record<string, unknown>).page ?? 1
+				const page = (props as unknown as Record<string, unknown>).pageNumber ?? 1
 				await moduleInstance?.draw(surfaceId, [
 					{
 						controlId: String(props.controlId),

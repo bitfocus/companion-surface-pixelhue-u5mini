@@ -19,7 +19,7 @@ class PixelhueSurfaceModule {
 	readonly #logger = createModuleLogger('PixelhueSurfaceModule')
 	readonly #context: HostContext
 	#discovery: any = null
-	/** connectionId（对应 surfaceId）-> OpenConnection */
+	/** surfaceId（endpoint级）-> OpenConnection */
 	#openConnections = new Map<string, OpenConnection>()
 	/** connectionId -> address:port */
 	#activeConnections = new Map<string, string>()
@@ -27,6 +27,12 @@ class PixelhueSurfaceModule {
 	#connectionRefCounts = new Map<string, number>()
 	/** address:port -> 共享的已建立连接 */
 	#sharedConnections = new Map<string, OpenConnection>()
+	/** address:port -> 建连中的 Promise（防止并发重复 connectTo） */
+	#connectingPromises = new Map<string, Promise<void>>()
+	/** address:port -> surfaceId（endpoint级唯一） */
+	#surfaceIdByAddress = new Map<string, string>()
+	/** surfaceId -> address:port */
+	#addressBySurfaceId = new Map<string, string>()
 	/** 每个 connectionId 只通知一次 opened */
 	#openedSurfaceIds = new Set<string>()
 
@@ -74,6 +80,9 @@ class PixelhueSurfaceModule {
 		this.#activeConnections.clear()
 		this.#connectionRefCounts.clear()
 		this.#sharedConnections.clear()
+		this.#connectingPromises.clear()
+		this.#surfaceIdByAddress.clear()
+		this.#addressBySurfaceId.clear()
 		this.#openedSurfaceIds.clear()
 	}
 
@@ -95,6 +104,9 @@ class PixelhueSurfaceModule {
 			const portNum = Number(config?.port)
 			const port = Number.isFinite(portNum) && portNum >= 1 && portNum <= 65535 ? Math.floor(portNum) : DEFAULT_TCP_PORT
 			const addressKey = `${address}:${port}`
+			const surfaceId = this.#surfaceIdFromEndpoint(address, port)
+			this.#surfaceIdByAddress.set(addressKey, surfaceId)
+			this.#addressBySurfaceId.set(surfaceId, addressKey)
 
 			// 无实际变化的更新
 			const oldAddressKey = this.#activeConnections.get(connectionId)
@@ -114,21 +126,43 @@ class PixelhueSurfaceModule {
 			// 若该 address:port 已连接，则复用同一条 socket，并通过 connectionId 进行别名
 			const existingShared = this.#sharedConnections.get(addressKey)
 			if (existingShared) {
-				this.#openConnections.set(connectionId, existingShared)
+				this.#openConnections.set(surfaceId, existingShared)
 				if (existingShared.socketWrapper?.isConnected?.()) {
-					this.#notifyOpenedSurface(connectionId, address, port)
+					this.#notifyOpenedSurface(surfaceId, address, port)
+				}
+				continue
+			}
+
+			const pending = this.#connectingPromises.get(addressKey)
+			if (pending) {
+				await pending
+				const sharedAfterPending = this.#sharedConnections.get(addressKey)
+				if (sharedAfterPending) {
+					this.#openConnections.set(surfaceId, sharedAfterPending)
+					if (sharedAfterPending.socketWrapper?.isConnected?.()) {
+						this.#notifyOpenedSurface(surfaceId, address, port)
+					}
+				} else {
+					// 并发等待的建连失败，回滚本次预先增加的映射与引用计数
+					this.#releaseConnectionReference(connectionId, addressKey)
 				}
 				continue
 			}
 
 			try {
-				const connectionManager = new MiniConnectionManager()
-				const socketWrapper = await connectionManager.connectTo(address, port)
-				this.#onConnected({ connectionId, addressKey, socketWrapper, connectionManager, address, port })
+				const connectPromise = (async (): Promise<void> => {
+					const connectionManager = new MiniConnectionManager()
+					const socketWrapper = await connectionManager.connectTo(address, port)
+					this.#onConnected({ surfaceId, addressKey, socketWrapper, connectionManager, address, port })
+				})()
+				this.#connectingPromises.set(addressKey, connectPromise)
+				await connectPromise
 			} catch (error: unknown) {
 				this.#logger.error(`Failed to connect to ${address}:${port}: ${JSON.stringify(error)}`)
 				// 连接失败，回滚引用计数等记录
 				this.#releaseConnectionReference(connectionId, addressKey)
+			} finally {
+				this.#connectingPromises.delete(addressKey)
 			}
 		}
 	}
@@ -138,7 +172,8 @@ class PixelhueSurfaceModule {
 	 * 关闭对应的 socket/连接并清理内部状态。
 	 */
 	async stopRemoteConnections(connectionIds: string[]): Promise<void> {
-		for (const id of connectionIds) {
+		const dedupedConnectionIds = new Set(connectionIds)
+		for (const id of dedupedConnectionIds) {
 			const addressKey = this.#activeConnections.get(id)
 			if (!addressKey) continue
 			this.#releaseConnectionReference(id, addressKey)
@@ -150,9 +185,15 @@ class PixelhueSurfaceModule {
 	 * 当宿主明确关闭 surface 时，关闭对应连接。
 	 */
 	async closeDevice(surfaceId: string): Promise<void> {
-		const addressKey = this.#activeConnections.get(surfaceId)
+		const addressKey = this.#addressBySurfaceId.get(surfaceId)
 		if (!addressKey) return
-		this.#releaseConnectionReference(surfaceId, addressKey)
+		const idsToRelease: string[] = []
+		for (const [connectionId, key] of this.#activeConnections.entries()) {
+			if (key === addressKey) idsToRelease.push(connectionId)
+		}
+		for (const connectionId of idsToRelease) {
+			this.#releaseConnectionReference(connectionId, addressKey)
+		}
 	}
 
 	/**
@@ -230,14 +271,14 @@ class PixelhueSurfaceModule {
 	 * 绑定 socket 事件（data/disconnected/error），并向宿主上报该远程 surface 已打开。
 	 */
 	#onConnected({
-		connectionId,
+		surfaceId,
 		addressKey,
 		socketWrapper,
 		connectionManager,
 		address,
 		port,
 	}: {
-		connectionId: string
+		surfaceId: string
 		addressKey: string
 		socketWrapper: any
 		connectionManager: any
@@ -248,6 +289,10 @@ class PixelhueSurfaceModule {
 
 		const close = (): void => {
 			if (closed) return
+			const current = this.#openConnections.get(surfaceId)
+			if (current && current.socketWrapper !== socketWrapper) {
+				return
+			}
 			closed = true
 			try {
 				connectionManager?.disconnectFrom?.(address, port, {
@@ -260,17 +305,19 @@ class PixelhueSurfaceModule {
 			for (const [id, key] of this.#activeConnections.entries()) {
 				if (key === addressKey) {
 					this.#activeConnections.delete(id)
-					this.#openConnections.delete(id)
-					this.#openedSurfaceIds.delete(id)
-					this.#context.disconnected?.(id)
 				}
 			}
+			this.#openConnections.delete(surfaceId)
+			this.#openedSurfaceIds.delete(surfaceId)
+			this.#surfaceIdByAddress.delete(addressKey)
+			this.#addressBySurfaceId.delete(surfaceId)
+			this.#context.disconnected?.(surfaceId)
 			this.#connectionRefCounts.delete(addressKey)
 			this.#sharedConnections.delete(addressKey)
 		}
 
 		const conn: OpenConnection = {
-			connectionId,
+			connectionId: surfaceId,
 			socketWrapper,
 			connectionManager,
 			address,
@@ -280,24 +327,27 @@ class PixelhueSurfaceModule {
 			drawQueueRunning: false,
 		}
 		this.#sharedConnections.set(addressKey, conn)
-		this.#openConnections.set(connectionId, conn)
+		this.#openConnections.set(surfaceId, conn)
 
 		socketWrapper.on?.('connected', () => {
-			// Notify all aliases on the same endpoint
-			for (const [id, key] of this.#activeConnections.entries()) {
-				if (key === addressKey) {
-					this.#notifyOpenedSurface(id, address, port)
-				}
-			}
+			this.#notifyOpenedSurface(surfaceId, address, port)
 
 			// If there are queued draw items, try draining now.
 			if (conn.drawQueue.length > 0) {
-				this.#drainDrawQueue(connectionId)
+				this.#drainDrawQueue(surfaceId)
 			}
 		})
 
+		// 某些实现里 connectTo 返回时可能已经 connected，兜底补发 opened。
+		if (socketWrapper?.isConnected?.()) {
+			this.#notifyOpenedSurface(surfaceId, address, port)
+			if (conn.drawQueue.length > 0) {
+				this.#drainDrawQueue(surfaceId)
+			}
+		}
+
 		socketWrapper.on?.('data', (data: unknown, _requestId: number) => {
-			this.#handleDeviceData(connectionId, data as Record<string, unknown>)
+			this.#handleDeviceData(surfaceId, data as Record<string, unknown>)
 		})
 		socketWrapper.on?.('error', (error: Error) => {
 			const tcpWrapper = socketWrapper.getTcpWrapper?.()
@@ -324,7 +374,9 @@ class PixelhueSurfaceModule {
 	#handleDeviceData(surfaceId: string, data: Record<string, unknown>): void {
 		try {
 			this.#logger.debug(`receive data surfaceId=${surfaceId} payload=${JSON.stringify(data)}`)
-		} catch {}
+		} catch {
+			// ignore payload stringify/log errors
+		}
 		if (!data || typeof data !== 'object') return
 
 		const events = this.#context.surfaceEvents
@@ -344,9 +396,6 @@ class PixelhueSurfaceModule {
 	 */
 	#releaseConnectionReference(connectionId: string, addressKey: string): void {
 		this.#activeConnections.delete(connectionId)
-		this.#openConnections.delete(connectionId)
-		this.#openedSurfaceIds.delete(connectionId)
-		this.#context.disconnected?.(connectionId)
 
 		const currentRefCount = this.#connectionRefCounts.get(addressKey)
 		if (currentRefCount === undefined) return
@@ -422,6 +471,10 @@ class PixelhueSurfaceModule {
 	 */
 	#connectionId(device: DeviceInfoT): string {
 		return `${PIXELHUE_U5_MINI_NAME}-${device.serialNumber ?? `${PIXELHUE_U5_MINI_NAME}_${device.address}_${device.port}`}`
+	}
+
+	#surfaceIdFromEndpoint(address: string, port: number): string {
+		return `${PIXELHUE_U5_MINI_NAME}:${address}:${port}`
 	}
 
 	/**
